@@ -1,0 +1,232 @@
+import torch
+from utils import one_step_animation, rollout_animation, pca_modes, visualize_ellipsoid, compare_distributions, pca_histogram_eval, evaluate_fourier_spectrum, spatial_corr, fourier_spectrum_2d,energy_time
+from model import ECO
+import sys
+from pathlib import Path
+import os
+import numpy as np
+
+
+
+def run_functions(params,param_path_parent,Re,ICscale,m):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    trunk_scale = 1
+    # m = 64
+    n = 2
+    model_folder = param_path_parent
+    print(model_folder)
+    figs_dir = figs_folder = f'{model_folder}/eval_results_ICscale{ICscale}_M{m}'
+    if not os.path.exists(figs_folder):
+        os.makedirs(figs_folder)
+
+    # for key, value in params.items():
+    #     print(f"{key}: {value}")
+
+    model_params = {
+        'm': m,
+        'n': n,
+        'c0': params['c0'],
+        'project': params['project'],
+        'diag_Q': params['diag_Q'],
+        'branch_conv_channels': params['branch_conv_channels'].tolist(),
+        'branch_fc_dims': params['branch_fc_dims'].tolist(),
+        'trunk_hidden_dims': params['trunk_hidden_dims'].tolist(),
+        'output_dim': params['output_dim'],
+        'dt': params['dt'],
+        'backbone': params.get('backbone','deeponet'),
+        'nn_Q': params.get('nn_Q',False),
+        'nn_x0': params.get('nn_x0',False)
+    }
+
+    print(f'NN X0: {model_params["nn_x0"]}')
+    model = ECO(model_params).to(device)
+    if model.project and model.V.nn_Q:
+        model.V.Q_func.initialized_output = True
+    print(next(model.parameters()).is_cuda)
+    num_params = sum(v.numel() for v in model.parameters() if v.requires_grad)
+    print(f'model params: {num_params}')
+
+
+    model.load_state_dict(torch.load(f'{model_folder}/model_epoch_best.pt',map_location=device))
+    model.eval()
+
+    print(f'MODEL PROJECT: {model.project}')
+
+    ### LOAD DATA
+    print('LOADING TEST DATA')
+    dt = 1.0
+    if Re == '40':
+        file_dir = f'data/KF_Re40_M128_tsave1_dt0.0005_T500_n220/data.pt'
+        data = torch.load(file_dir)
+        data_animate = torch.load(f'data/KF_Re40_M128_tsave1_dt0.0005_T2000_n1/data.pt')
+    elif Re == '500':
+        file_dir = f'data/KF_Re500_M128_tsave1_dt0.0001_T500_n220/data.pt'
+        # file_dir = f'data_archive/KF_Re500_M128_tsave1_T500_n200/data.pt'
+        data = torch.load(file_dir)
+        data_animate = torch.load(f'data/KF_Re500_M128_tsave1_dt0.0001_T2000_n1/data.pt')#[:,::2,::2,:]
+    if m==64:
+        data = data[:,::2,::2,:]
+        data_animate = data_animate[:,::2,::2,:]
+        # data = data[:,:,:,::2]
+        # if dt == 0.5:
+        #     data = data[::2,...]
+        # if dt == 1.0:
+        #     # data = data[...,::2]
+        #     data_animate = data_animate[...,::2] # assuming dt = 1.0
+        print(data.shape)
+    data = data[205:,:,:,200:]
+    # data = data[185:,:,:,200:]
+    print(data.shape)
+    s = data.shape[1] # assuming data has shape n_traj, dim1, dim2, n_time and dim1 = dim2
+    grids = []
+
+    # data_animate = torch.load(f'data/KF_Re{Re}_M128_tsave0.5_T5000_n1/data.pt')[...,::2] # assuming dt = 1.0
+    # data_animate = torch.load(f'data/KF_Re{Re}_M64_tsave1_T5000_n1/data.pt') # assuming dt = 1.0
+    data_animate = data_animate[...,:500].permute(0,3,1,2).reshape(-1,s*s).to(device)
+    grids.append(np.linspace(0, 2*np.pi, s, dtype=np.float32) * trunk_scale)
+    grids.append(np.linspace(2*np.pi, 0, s, dtype=np.float32) * trunk_scale) # position (0,0) of matrix is point (0,1) on plot (top left)
+
+    x_trunk_input = torch.tensor(np.vstack([xx.ravel() for xx in np.meshgrid(*grids)]).T).to(device)
+
+    ## GET MODEL PARAMETERS
+    if model.project:
+        if model.V.nn_Q:
+            Q = model.V._construct_Q(x_trunk_input).detach().cpu().numpy() # first input is dummy
+            Q = np.diag(np.squeeze(Q))
+            if model.V.nn_x0:
+                x0 = model.V._construct_x0(x_trunk_input).detach().cpu().numpy()
+                x0 = x0.reshape(1,m**2)
+            else:
+                x0 = np.zeros((1,m**2))
+        else:
+            Q = torch.diag(model.V._construct_Q()).detach().cpu().numpy()
+            x0 = model.V.x_0.detach().detach().cpu().numpy()
+            x0.reshape(1,m**2)
+        c = model.c.detach().cpu().numpy()
+    else:
+        Q = np.eye(m**2,dtype=np.float64)
+        c = 30.0
+        x0 = np.zeros((1,m**2))
+
+    # x0 = np.zeros((1,m**2))
+    if params['project']:
+        print('LEARNED Q: ')
+        print(np.diag(Q))
+        print('LEARNED X0:')
+        print(x0)
+    
+    # print('Q SHAPE')
+    # print(Q.shape)
+    # print(Q)
+    # print('new Q shape')
+    # Q = np.diag(np.squeeze(Q))
+    # print(Q.shape)
+
+    gt_traj = data.permute(0,3,1,2).reshape(-1,s*s).to(device)
+    print(gt_traj.shape)
+
+    ## ONE STEP COMPARISON W GROUND TRUTH
+    print('ONE STEP COMPARISON')
+    one_step_animation(model=model,
+        x_val = (data_animate[:-1,...],x_trunk_input),
+        y_val = data_animate[1:,...],
+        figs_dir=figs_dir,
+        s=s)
+
+    ## ROLLOUT COMPARISON W GROUND TRUTH
+    pred_traj = rollout_animation(model=model,
+        x_val = (data_animate[:-1,...],x_trunk_input),
+        y_val = data_animate[1:,...],
+        figs_dir=figs_dir,
+        s=s,
+        ICscale=ICscale)
+    pred_traj = pred_traj.to(device)
+    
+    ## FIRST TEN PCA MODES
+    print('PCA MODES (method A)')
+    x0_torch = torch.tensor(x0,device=device)
+    print(gt_traj.shape)
+    print((gt_traj-x0_torch).shape)
+    pca_modes(w_data=gt_traj-x0_torch,w_model=pred_traj-x0_torch,figs_dir=figs_dir,s=s,device=device)
+
+    ## SPATIAL CORRELATION
+    print('SPATIAL CORRELATION')
+    spatial_corr(u_data=gt_traj.detach().cpu().numpy(),
+        u_model=pred_traj.detach().cpu().numpy(),
+        figs_dir=figs_dir,
+        s=s)
+
+    ## PCA PLOT
+    row_norms = torch.norm(pred_traj, p=2, dim=1)
+    mask = row_norms<1e10
+    print(mask.shape)
+    pred_traj_pca = pred_traj[mask,:]-x0_torch
+    print('PCA PROJECTION')
+    pca_traj_gt, pca_traj_pred = visualize_ellipsoid(gt_traj = gt_traj-x0_torch, 
+        pred_traj = pred_traj_pca, 
+        figs_dir=figs_dir, 
+        Q=Q, 
+        c=c,
+        tag='')
+
+    ## DISTRIBUTION COMPARISON FOR DATA
+    print('DISTRIBUTION COMPARISON FOR TRAJECTORY')
+    pred_traj_np = pred_traj.detach().cpu().numpy()
+    kl_div_traj = compare_distributions(gt_traj = gt_traj.detach().cpu().numpy().ravel(), 
+        pred_traj = pred_traj_np.ravel(), 
+        bins = 50,
+        plot=True, 
+        save_name=f'{figs_dir}/distribution_traj.png')
+
+
+    # ## DISTRIBUTION COMPARISON FOR PCA MODES
+    print('DISTRIBUTION COMPARISON FOR PCA MODES')
+    pca_histogram_eval(gt_pca=pca_traj_gt, 
+        pred_pca=pca_traj_pred, 
+        bins=50, 
+        # lim=[[-250.0, 250.0], [-250.0, 250.0]], 
+        lim = None,
+        save_path=f'{figs_dir}/distribution_pca.png', 
+        title_gt='Ground Truth', 
+        title_pred='Prediction')
+
+    ## FOURIER SPECTRUM
+    print('FOURIER SPECTRUM COMPARISON')
+    print(gt_traj.shape)
+    print(pred_traj.shape)
+    fourier_spectrum_2d(gt_traj=gt_traj,pred_traj=pred_traj,s=s,figs_dir=figs_dir,device=device)
+
+    ## V OVER TIME
+    print('Energy over time')
+    n = data_animate.shape[0]
+    energy_time(gt_traj=gt_traj[:5000],pred_traj=pred_traj[:5000],Q=torch.tensor(np.diag(Q),device=device,dtype=torch.float32),model=model,figs_dir=figs_dir,x0=x0_torch)
+
+
+
+def main(param_path_str,Re):
+    param_path = Path(param_path_str)
+    output_path = param_path.parent / "results.npz"  # Same directory as params.npz
+
+    # Load data
+    data = np.load(param_path)
+
+    # Process
+    ICscales = [30,1]
+    ms = [64]
+    for ICscale in ICscales:
+        for m in ms:
+            result = run_functions(data,str(param_path.parent),Re,ICscale,m)
+
+    # # Save result
+    # np.savez(output_path, **result)
+    # print(f"Saved results to: {output_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python process_params.py /path/to/params.npz")
+        sys.exit(1)
+
+    print(sys.argv[1])
+    print(sys.argv[2])
+
+    main(sys.argv[1],sys.argv[2])
