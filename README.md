@@ -66,12 +66,10 @@ Trained_Models/
     KF/Re500_FNO_{constrained,unconstrained}/
 ```
 
-Note that the 512-grid KS test folder name really does end in `.npz`.
-
 Each folder in `Trained_Models/` contains `model_epoch_best.pt` (the checkpoint) and `model_params.npz`
 (the architecture settings used to rebuild the model). "Constrained" models use the ECO projection
 layer, and "unconstrained" models are the same backbone without it.
-<!--
+
 ## Evaluating the trained models
 
 Run each command from inside the system's folder.
@@ -110,44 +108,70 @@ python eval.py --model-dir Trained_Models/<date>/<run_name>
 ## Training
 
 Each `train.py` saves its run to `Trained_Models/<MMDD_HH>/<run_name>/` inside the system's folder. The
-commands below rebuild the architectures of the models in `Trained_Models/`.
-<!-- TODO: add the training hyperparameters used in the paper (--epochs, --lr, --bsize, --lam_reg_vol, and for KF --n_traj and --sched); these are not stored in model_params.npz. -->
-<!--
-**KS** (from `KS/`):
+commands below reproduce the models in `Trained_Models/`. Any setting not listed uses the default in
+`train.py`. No random seed is fixed, so a rerun gives a comparable model (not an identical one).
+
+The unconstrained commands pass `--no-nn_Q --no-nn_x0`. The $Q$ and $x_0$ networks only exist when
+`--project` is set, so these flags don't change the model. They keep `nn_Q`/`nn_x0` out of the run's folder
+name and `model_params.npz`, since both default to on.
+
+**KS** (from `KS/`). The defaults are the DeepONet backbone, a learning rate of 1e-4, a batch size of 2048,
+and branch convolution channels `32 64 128`.
 
 ```bash
-# DeepONet (note --trunk_scale 0.05; see below)
-python train.py --backbone deeponet --trunk_scale 0.05 --output_dim 256 --branch_conv_channels 32 64 128 \
-    --branch_fc_dims 256 --trunk_hidden_dims 256 256 256 --dt 1.0 \
-    --project --diag_Q --discrete_proj --c_init 175.0                    # constrained
-python train.py --backbone deeponet --trunk_scale 0.05 --output_dim 256 --branch_conv_channels 32 64 128 \
-    --branch_fc_dims 256 --trunk_hidden_dims 256 256 256 --dt 1.0 \
-    --no-nn_Q --no-nn_x0                                                 # unconstrained
+# DeepONet, constrained
+python train.py --epochs 40000 --trunk_scale 0.05 --dt 1.0 \
+    --output_dim 256 --branch_fc_dims 256 --trunk_hidden_dims 256 256 256 \
+    --project --lam_reg_vol 0.1 --c_init 175.0 --discrete_proj
 
-# FNO
-python train.py --backbone fno --dt 1.0 --project --diag_Q --discrete_proj --c_init 80.0   # constrained
-python train.py --backbone fno --dt 1.0 --no-nn_Q --no-nn_x0                               # unconstrained
+# DeepONet, unconstrained
+python train.py --epochs 40000 --trunk_scale 0.05 --dt 1.0 \
+    --output_dim 256 --branch_fc_dims 256 --trunk_hidden_dims 256 256 256 \
+    --no-nn_Q --no-nn_x0
+
+# FNO, constrained
+python train.py --backbone fno --epochs 40000 --dt 1.0 \
+    --project --lam_reg_vol 0.1 --c_init 80.0 --discrete_proj
+
+# FNO, unconstrained
+python train.py --backbone fno --epochs 40000 --dt 1.0 --no-nn_Q --no-nn_x0
 ```
 
 `--trunk_scale` multiplies the spatial grid before it is passed to the network (the DeepONet trunk, the FNO
 grid channel, and the $Q$ and $x_0$ networks). The KS DeepONet models were trained with `0.05` and the FNO
 models with the default `1.0`. It is saved in `model_params.npz`, and `eval.py` reads it from there.
 
-**KF** (from `KF/`):
+**KF** (from `KF/`). The training data is stored on a 128×128 grid and downsampled to 64×64 for training.
+The defaults are Re = 40, the FNO backbone, 200 training trajectories and `--dt 1.0`. With
+`--sched multistep`, the learning rate is halved at epochs 10, 20, 30, 40 and 50.
 
 ```bash
-# FNO, Re = 40 (use --Re 500 for Re = 500, with --c_init 400.0 for the constrained model)
-python train.py --Re 40 --backbone fno --project --c_init 300.0          # constrained
-python train.py --Re 40 --backbone fno --no-nn_Q --no-nn_x0              # unconstrained
+# Re = 40, FNO, constrained
+python train.py --epochs 50 --lr 0.0005 --bsize 50 --sched multistep \
+    --project --lam_reg_vol 0.001 --c_init 300.0
 
-# DeepONet, Re = 40
-python train.py --Re 40 --backbone deeponet --output_dim 1024 --branch_conv_channels 64 128 256 512 \
-    --branch_fc_dims 1024 --trunk_hidden_dims 1024 1024 1024 1024 --project --diag_Q --c_init 400.0   # constrained
-python train.py --Re 40 --backbone deeponet --output_dim 1024 --branch_conv_channels 64 128 256 512 \
-    --branch_fc_dims 1024 --trunk_hidden_dims 1024 1024 1024 1024 --no-nn_Q --no-nn_x0                 # unconstrained
+# Re = 40, FNO, unconstrained
+python train.py --epochs 50 --lr 5e-05 --bsize 50 --sched multistep --no-nn_Q --no-nn_x0
+
+# Re = 40, DeepONet, constrained
+python train.py --backbone deeponet --epochs 700 --lr 0.0001 --bsize 500 \
+    --output_dim 1024 --branch_conv_channels 64 128 256 512 --branch_fc_dims 1024 \
+    --trunk_hidden_dims 1024 1024 1024 1024 \
+    --project --lam_reg_vol 0.01 --c_init 400.0
+
+# Re = 40, DeepONet, unconstrained
+python train.py --backbone deeponet --epochs 1000 --lr 5e-05 --bsize 2048 \
+    --output_dim 1024 --branch_conv_channels 64 128 256 512 --branch_fc_dims 1024 \
+    --trunk_hidden_dims 1024 1024 1024 1024 \
+    --no-nn_Q --no-nn_x0
+
+# Re = 500, FNO, constrained
+python train.py --Re 500 --epochs 50 --lr 0.0005 --bsize 50 --sched multistep \
+    --project --lam_reg_vol 0.01 --c_init 400.0
+
+# Re = 500, FNO, unconstrained
+python train.py --Re 500 --epochs 50 --lr 0.0005 --bsize 50 --sched multistep --no-nn_Q --no-nn_x0
 ```
-
-The training data is stored on a 128×128 grid and downsampled to 64×64 for training.
 
 **L63** (from `L63/`):
 
@@ -163,8 +187,3 @@ Run `python train.py --help` in any folder to see all options.
 - **KF:** `KF/KF_data_gen.py`. The Reynolds number, time step, length and number of trajectories are set at
   the top of the file, and it requires a CUDA GPU.
 - **KS:** use the provided data on Zenodo.
-
-## Citation
--->
-
-<!-- TODO: BibTeX for the paper and the Zenodo record -->
